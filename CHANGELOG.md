@@ -3,6 +3,10 @@
 ## v0.16.0
 
 - [core] added a new React-based dialog type `ReactDialog` [#6855](https://github.com/eclipse-theia/theia/pull/6855)
+- [repo] added 2 new npm scripts:
+  - `test:references`: fails if typescript references are out of sync.
+  - `update:references`: updates typescript references, if required.
+- [repo] the `test` script now checks if typescript references are in sync.
 
 Breaking changes:
 

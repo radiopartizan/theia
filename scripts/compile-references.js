@@ -23,6 +23,11 @@
  * only when required, but it cannot infer workspaces by itself, it has to be
  * explicitly defined [1].
  *
+ * This script exits with a code different from zero if something needed to be
+ * updated.
+ *
+ * You can do a dry run using the cli flag `--dry-run`.
+ *
  * [1]: https://www.typescriptlang.org/docs/handbook/project-references.html
  */
 
@@ -32,45 +37,64 @@ const cp = require('child_process');
 const path = require('path').posix;
 const fs = require('fs');
 
-const CWD = path.join(__dirname, '..');
+const ROOT = path.join(__dirname, '..');
 
-const FORCE_REWRITE = Boolean(process.env['THEIA_REPO_FORCE_REWRITE']);
+const DRY_RUN = popFlag(process.argv, '--dry-run');
+
+const FORCE_REWRITE = popFlag(process.argv, '--force-rewrite');
 
 /** @type {{ [packageName: string]: YarnWorkspace }} */
 const YARN_WORKSPACES = JSON.parse(cp.execSync('yarn --silent workspaces info').toString());
 
-/** @type {YarnWorkspace} */
-const THEIA_MONOREPO = {
-    workspaceDependencies: Object.keys(YARN_WORKSPACES),
-    location: '.',
-};
-
-// Configure all `compile.tsconfig.json` files of this monorepo
-for (const packageName of Object.keys(YARN_WORKSPACES)) {
-    const workspacePackage = YARN_WORKSPACES[packageName];
-    const tsconfigCompilePath = path.join(CWD, workspacePackage.location, 'compile.tsconfig.json');
-    const references = getTypescriptReferences(workspacePackage);
-    configureTypeScriptCompilation(tsconfigCompilePath, references);
+// Add the package name inside each package object.
+for (const [packageName, yarnWorkspace] of Object.entries(YARN_WORKSPACES)) {
+    yarnWorkspace.name = packageName;
 }
 
+/** @type {YarnWorkspace} */
+const THEIA_MONOREPO = {
+    name: '@theia/monorepo',
+    workspaceDependencies: Object.keys(YARN_WORKSPACES),
+    location: ROOT,
+};
+
 {
-    const tsconfigCompilePath = path.join(CWD, 'configs', 'root-compilation.tsconfig.json');
-    const references = getTypescriptReferences({
-        workspaceDependencies: Object.keys(YARN_WORKSPACES),
-        location: path.join(CWD, 'configs'),
-    });
-    configureTypeScriptCompilation(tsconfigCompilePath, references);
+    let rewriteRequired = false;
+
+    // Configure all `compile.tsconfig.json` files of this monorepo
+    for (const packageName of Object.keys(YARN_WORKSPACES)) {
+        const workspacePackage = YARN_WORKSPACES[packageName];
+        const tsconfigCompilePath = path.join(ROOT, workspacePackage.location, 'compile.tsconfig.json');
+        const references = getTypescriptReferences(workspacePackage);
+        rewriteRequired |= configureTypeScriptCompilation(workspacePackage, tsconfigCompilePath, references);
+    }
+
+    // Configure our root compilation configuration, living inside `configs/root-compilation.tsconfig.json`.
+    const configsFolder = path.join(ROOT, 'configs');
+    const tsconfigCompilePath = path.join(configsFolder, 'root-compilation.tsconfig.json');
+    const references = getTypescriptReferences(THEIA_MONOREPO, configsFolder);
+    rewriteRequired |= configureTypeScriptCompilation(THEIA_MONOREPO, tsconfigCompilePath, references);
 
     // Configure the root `tsconfig.json` for code navigation using `tsserver`.
-    const tsconfigNavPath = path.join(CWD, 'tsconfig.json');
-    configureTypeScriptNavigation(tsconfigNavPath);
+    const tsconfigNavPath = path.join(ROOT, 'tsconfig.json');
+    rewriteRequired |= configureTypeScriptNavigation(THEIA_MONOREPO, tsconfigNavPath);
+
+    // CI will be able to tell if references got changed by looking at the exit code.
+    if (rewriteRequired) {
+        if (DRY_RUN) {
+            // Running a dry run usually only happens when a developer or CI runs the tests, so we only print the help then.
+            console.error('TypeScript references seem to be out of sync, run "yarn update:references" to fix.');
+        }
+        process.exitCode = 1;
+    }
 }
 
 /**
  * @param {YarnWorkspace} requestedPackage
+ * @param {string} [overrideLocation] affects how relative paths are computed.
  * @returns {string[]} project references for `requestedPackage`.
  */
-function getTypescriptReferences(requestedPackage) {
+function getTypescriptReferences(requestedPackage, overrideLocation) {
     const references = [];
     for (const dependency of requestedPackage.workspaceDependencies || []) {
         const depWorkspace = YARN_WORKSPACES[dependency];
@@ -78,7 +102,7 @@ function getTypescriptReferences(requestedPackage) {
         if (!fs.existsSync(depConfig)) {
             continue;
         }
-        const relativePath = path.relative(requestedPackage.location, depWorkspace.location);
+        const relativePath = path.relative(overrideLocation || requestedPackage.location, depWorkspace.location);
         references.push(relativePath);
     }
     return references;
@@ -88,10 +112,12 @@ function getTypescriptReferences(requestedPackage) {
  * Wires a given compilation tsconfig file according to the provided references.
  * This allows TypeScript to operate in build mode.
  *
+ * @param {YarnWorkspace} targetPackage for debug purpose.
  * @param {string} tsconfigPath path to the tsconfig file to edit.
  * @param {string[]} references list of paths to the related project roots.
+ * @returns {boolean} rewrite was needed.
  */
-function configureTypeScriptCompilation(tsconfigPath, references) {
+function configureTypeScriptCompilation(targetPackage, tsconfigPath, references) {
     if (!fs.existsSync(tsconfigPath)) {
         return;
     }
@@ -112,7 +138,30 @@ function configureTypeScriptCompilation(tsconfigPath, references) {
         };
         needRewrite = true;
     }
-    const currentReferences = new Set((tsconfigJson['references'] || []).map(reference => reference.path));
+    const currentReferences = new Set(
+        (tsconfigJson['references'] || [])
+            // We will work on a set of paths, easier to handle than objects.
+            .map(reference => reference.path)
+            // Remove any invalid reference (maybe outdated).
+            .filter(referenceRelativePath => {
+                const referencePath = path.join(path.dirname(tsconfigPath), referenceRelativePath);
+                try {
+                    const referenceStat = fs.statSync(referencePath);
+                    const isValid = referenceStat.isDirectory() && fs.statSync(path.join(referencePath, 'tsconfig.json')).isFile()
+                        || referenceStat.isFile(); // still could be something else than a tsconfig, but good enough.
+
+                    if (!isValid) {
+                        needRewrite = true;
+                    }
+                    return isValid; // keep or not
+
+                } catch {
+                    console.error(`${targetPackage.name} invalid typescript reference: ${referencePath}`);
+                    needRewrite = true;
+                    return false; // remove
+                }
+            })
+    );
     for (const reference of references) {
         const tsconfigReference = path.join(reference, 'compile.tsconfig.json');
         if (!currentReferences.has(tsconfigReference)) {
@@ -120,7 +169,7 @@ function configureTypeScriptCompilation(tsconfigPath, references) {
             needRewrite = true;
         }
     }
-    if (FORCE_REWRITE || needRewrite) {
+    if (!DRY_RUN && (FORCE_REWRITE || needRewrite)) {
         tsconfigJson.references = [];
         for (const reference of currentReferences) {
             tsconfigJson.references.push({
@@ -130,6 +179,7 @@ function configureTypeScriptCompilation(tsconfigPath, references) {
         const content = JSON.stringify(tsconfigJson, undefined, 2);
         fs.writeFileSync(tsconfigPath, content + '\n');
     }
+    return needRewrite;
 }
 
 /**
@@ -137,9 +187,11 @@ function configureTypeScriptCompilation(tsconfigPath, references) {
  * This setup is a shim for the TypeScript language server to provide cross-package navigation.
  * Compilation is done via `compile.tsconfig.json` files.
  *
+ * @param {YarnWorkspace} targetPackage for debug purpose.
  * @param {string} tsconfigPath
+ * @returns {boolean} rewrite was needed.
  */
-function configureTypeScriptNavigation(tsconfigPath) {
+function configureTypeScriptNavigation(targetPackage, tsconfigPath) {
     let needRewrite = false;
     const tsconfigJson = readJsonFile(tsconfigPath);
     if (typeof tsconfigJson.compilerOptions === 'undefined') {
@@ -185,9 +237,27 @@ function configureTypeScriptNavigation(tsconfigPath) {
             needRewrite = true;
         }
     }
-    if (FORCE_REWRITE || needRewrite) {
+    if (!DRY_RUN && (FORCE_REWRITE || needRewrite)) {
         const content = JSON.stringify(tsconfigJson, undefined, 2);
         fs.writeFileSync(tsconfigPath, content + '\n');
+        console.warn(`Updated references for ${targetPackage.name}.`);
+    }
+    return needRewrite;
+}
+
+/**
+ *
+ * @param {string[]} argv
+ * @param {string} flag
+ * @returns {boolean}
+ */
+function popFlag(argv, flag) {
+    const flagIndex = argv.indexOf(flag)
+    if (flagIndex !== -1) {
+        argv.splice(flagIndex, 1);
+        return true;
+    } else {
+        return false;
     }
 }
 
@@ -206,6 +276,7 @@ function readJsonFile(filePath) {
 
 /**
  * @typedef YarnWorkspace
+ * @property {string} name
  * @property {string} location
  * @property {string[]} workspaceDependencies
  */
